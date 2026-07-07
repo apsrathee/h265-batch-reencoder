@@ -69,6 +69,34 @@
 #    - Log banner now prints which encoder actually ran and with which
 #      settings, instead of always printing CRF/Preset (which are
 #      meaningless when running in AMF mode).
+#
+#  v4 changes vs v3 — AMF abandoned in favor of VAAPI:
+#    - v3 correctly diagnosed libx265 as the bug but pointed at hevc_amf as
+#      the fix. That turned out to be a dead end: AMD discontinued AMF on
+#      Linux as of driver release 25.20 ("AMF users are advised to
+#      transition to VA-API / Mesa Multimedia" — AMD's own release notes),
+#      and even the community's unofficial AMF successor package only
+#      supports RDNA3-and-later GPUs. Polaris10 (RX 570) predates that by
+#      two architecture generations and has no viable AMF path at all —
+#      confirmed by ffmpeg's hevc_amf failing to even dlopen the (now
+#      unshipped) libamfrt64.so.1 runtime.
+#    - Default GPU encoder is now hevc_vaapi, going through the exact same
+#      Mesa radeonsi VA-API stack that `vainfo` already confirmed exposes
+#      VAProfileHEVCMain / VAEntrypointEncSlice (hardware HEVC encode) on
+#      this card — no missing runtime, no proprietary blob, no dead ends.
+#    - VAAPI needs three distinct pieces that AMF's flag-only interface
+#      didn't require, now split across three arrays built once in
+#      build_encoder_args(): GLOBAL_ARGS (-vaapi_device, must precede -i
+#      since it's an input-level hwaccel context, not an output codec
+#      flag), FILTER_ARGS (-vf format=nv12,hwupload — VAAPI has no implicit
+#      CPU->GPU handoff, frames must be explicitly uploaded to the GPU
+#      surface), and ENCODER_ARGS (-c:v hevc_vaapi -qp N — VAAPI's
+#      constant-QP rate control; CRF still doesn't exist outside x265).
+#    - check_amf_available() replaced by check_vaapi_available(), probing
+#      $VAAPI_DEVICE (default /dev/dri/renderD128, confirmed via vainfo to
+#      resolve to the RX 570 on this box) instead of a runtime library that
+#      will never be present again.
+#    - libx265 fallback path is functionally unchanged from v2/v3.
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -uo pipefail
@@ -83,16 +111,23 @@ SLEEP_BETWEEN=5
 TEMP_HALT=58                         # °C — pause encode at/above this
 TEMP_RESUME=53                       # °C — resume once cooled to at/below this
                                       # (5°C hysteresis avoids rapid pause/resume flapping)
-ENCODER="${H265_ENCODER:-hevc_amf}" # hevc_amf (GPU, default) | libx265 (CPU fallback)
+ENCODER="${H265_ENCODER:-hevc_vaapi}" # hevc_vaapi (GPU, default) | libx265 (CPU fallback)
                                       # override per-run: H265_ENCODER=libx265 bash h265_batch.sh ...
-QP=18                                 # AMF rate-control target (rc=cqp), used when ENCODER=hevc_amf
+                                      # NOTE: AMD dropped AMF on Linux as of driver 25.20 and
+                                      # its community successor only supports RDNA3+. Polaris10
+                                      # (RX 570) has no viable AMF path — VA-API/Mesa is the
+                                      # correct and only supported GPU encode route for this card.
+VAAPI_DEVICE="${VAAPI_DEVICE:-/dev/dri/renderD128}" # confirmed via vainfo to resolve to the RX 570
+QP=18                                 # VAAPI rate-control target (constant QP), used when ENCODER=hevc_vaapi
 CRF=18                                # x265 rate-control target, used when ENCODER=libx265 (fallback)
-PRESET="medium"                       # x265-only; ignored by AMF
+PRESET="medium"                       # x265-only; ignored by VAAPI
 AUDIO_BR="192k"
 TEMP_SUFFIX=".h265part.mp4"          # in-progress marker, excluded from `find`
 ACTIVE_PID_FILE="/tmp/h265_active_pid_$$"
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
+GLOBAL_ARGS=()
+FILTER_ARGS=()
 ENCODER_ARGS=()
 CURRENT_TEMP=""
 TEMP_MONITOR_PID=""
@@ -260,52 +295,65 @@ get_video_codec() {
         "$1" 2>/dev/null
 }
 
-# ── AMF AVAILABILITY PROBE ────────────────────────────────────────────────────
-# Cheap 1-second synthetic encode to confirm ffmpeg's hevc_amf actually
-# initializes against this driver/runtime stack before committing a
-# multi-hour batch to it. If it fails (missing AMF userspace runtime, driver
-# mismatch, etc.) we fall back to libx265 for this run instead of either
-# hard-failing on file 1 or — worse — silently limping along on whatever
-# ffmpeg decided to substitute.
-check_amf_available() {
-    if [[ "$ENCODER" != "hevc_amf" ]]; then
+# ── VAAPI AVAILABILITY PROBE ──────────────────────────────────────────────────
+# Cheap 1-second synthetic encode to confirm ffmpeg's hevc_vaapi actually
+# initializes against $VAAPI_DEVICE before committing a multi-hour batch to
+# it. AMD dropped AMF on Linux as of driver 25.20 (successor package only
+# covers RDNA3+), so VA-API/Mesa is the only viable GPU encode path on
+# Polaris10 — this replaces the earlier hevc_amf probe entirely rather than
+# sitting alongside it.
+check_vaapi_available() {
+    if [[ "$ENCODER" != "hevc_vaapi" ]]; then
         return
     fi
-    log "Checking hevc_amf (GPU hardware encode) availability ..."
-    if ffmpeg -hide_banner -loglevel error -f lavfi \
-        -i "testsrc=duration=1:size=1280x720:rate=30" \
-        -c:v hevc_amf -f null - &>/dev/null; then
-        log "  OK: hevc_amf initialized — using GPU hardware encode for this session."
+    log "Checking hevc_vaapi (GPU hardware encode via $VAAPI_DEVICE) availability ..."
+    if ffmpeg -hide_banner -loglevel error \
+        -vaapi_device "$VAAPI_DEVICE" \
+        -f lavfi -i "testsrc=duration=1:size=1280x720:rate=30" \
+        -vf "format=nv12,hwupload" \
+        -c:v hevc_vaapi -f null - &>/dev/null; then
+        log "  OK: hevc_vaapi initialized on $VAAPI_DEVICE — using GPU hardware encode."
     else
-        log "  WARN: hevc_amf failed to initialize on this system."
+        log "  WARN: hevc_vaapi failed to initialize on $VAAPI_DEVICE."
         log "        Falling back to libx265 (CPU) for this run."
-        log "        To diagnose: 'ffmpeg -encoders | grep amf' and 'vainfo | grep -i hevc'"
+        log "        Diagnose: 'vainfo --display drm --device $VAAPI_DEVICE | grep -i hevc'"
         ENCODER="libx265"
     fi
 }
 
 # ── ENCODER ARG BUILDER ───────────────────────────────────────────────────────
 # Resolves the chosen ENCODER into the actual ffmpeg flags, once, up front.
-# AMF has no concept of CRF/preset — its rate control is -rc cqp with
-# separate -qp_i/-qp_p targets, and it wants nv12 natively (yuv420p would
-# force an extra swscale software color-convert pass before the frames even
-# reach the hardware encoder). libx265 path is untouched from v2.
+# VAAPI needs three distinct pieces ffmpeg doesn't let you fold together:
+#   GLOBAL_ARGS  → -vaapi_device must appear BEFORE -i (it's an input-level
+#                  hwaccel context, not a per-output codec flag)
+#   FILTER_ARGS  → frames must be explicitly uploaded to the GPU surface via
+#                  -vf format=nv12,hwupload before the VAAPI encoder can see
+#                  them — there is no implicit CPU->GPU handoff like AMF had
+#   ENCODER_ARGS → -c:v hevc_vaapi -qp N (VAAPI's constant-QP rate control;
+#                  CRF is still an x265-only concept and doesn't apply here)
+# libx265 path is untouched from v2/v3 and needs none of this — GLOBAL_ARGS
+# stays empty and FILTER_ARGS just carries the plain -pix_fmt flag.
 build_encoder_args() {
-    if [[ "$ENCODER" == "hevc_amf" ]]; then
+    if [[ "$ENCODER" == "hevc_vaapi" ]]; then
+        GLOBAL_ARGS=(
+            -vaapi_device "$VAAPI_DEVICE"
+        )
+        FILTER_ARGS=(
+            -vf "format=nv12,hwupload"
+        )
         ENCODER_ARGS=(
-            -c:v hevc_amf
-            -quality quality
-            -rc cqp
-            -qp_i "$QP"
-            -qp_p "$QP"
-            -pix_fmt nv12
+            -c:v hevc_vaapi
+            -qp "$QP"
         )
     else
+        GLOBAL_ARGS=()
+        FILTER_ARGS=(
+            -pix_fmt yuv420p
+        )
         ENCODER_ARGS=(
             -c:v libx265
             -crf "$CRF"
             -preset "$PRESET"
-            -pix_fmt yuv420p
         )
     fi
 }
@@ -354,7 +402,7 @@ fmt_eta() {
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 main() {
     check_deps
-    check_amf_available
+    check_vaapi_available
     build_encoder_args
     acquire_lock
     smart_preflight "$SMART_DEVICE"
@@ -366,8 +414,8 @@ main() {
     log " Session start"
     log " Input dir:    $INPUT_DIR"
     log " SMART device: $SMART_DEVICE"
-    if [[ "$ENCODER" == "hevc_amf" ]]; then
-        log " Encoder:      hevc_amf (GPU) | rc=cqp qp_i/qp_p=$QP | Audio: $AUDIO_BR"
+    if [[ "$ENCODER" == "hevc_vaapi" ]]; then
+        log " Encoder:      hevc_vaapi (GPU) | device=$VAAPI_DEVICE qp=$QP | Audio: $AUDIO_BR"
     else
         log " Encoder:      libx265 (CPU)  | CRF: $CRF | Preset: $PRESET | Audio: $AUDIO_BR"
     fi
@@ -465,10 +513,12 @@ main() {
         # -movflags +faststart      → moov atom up front, streaming-friendly
         ionice -c 3 nice -n 19 \
             ffmpeg -nostdin -hide_banner -loglevel warning -stats \
+                "${GLOBAL_ARGS[@]}" \
                 -i "$src" \
                 -map 0:v:0 \
                 -map "0:a:0?" \
                 -map_metadata 0 \
+                "${FILTER_ARGS[@]}" \
                 "${ENCODER_ARGS[@]}" \
                 -c:a aac \
                 -b:a "$AUDIO_BR" \
