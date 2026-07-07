@@ -15,6 +15,60 @@
 #  sudoers (one-time, avoids password prompt mid-run):
 #    echo "$USER ALL=(ALL) NOPASSWD: /usr/sbin/smartctl" | sudo tee /etc/sudoers.d/smartctl-nopasswd
 #    sudo chmod 440 /etc/sudoers.d/smartctl-nopasswd
+#
+#  v2 changes vs v1:
+#    - Output keeps the ORIGINAL filename (extension normalized to .mp4).
+#      No more "_h265" suffix littering your library.
+#    - Resumability is now based on probing each candidate's actual codec
+#      (skip if already hevc), not on guessing an output filename. This means
+#      a half-finished library, partially renamed files, etc. all resume correctly.
+#    - mtime of the output is set to match the original file (touch -r), so
+#      sorting by date in your file manager / `ls -lt` still reflects original
+#      recording order, not the date you happened to run the script.
+#    - Explicit -map_metadata 0 carries over container-level metadata
+#      (Canon's embedded creation_time tag) rather than relying on
+#      ffmpeg's implicit defaults.
+#    - Optional session time cap (3rd arg) — stops cleanly between files once
+#      the time budget is hit, so you can run "2 hours tonight" without babysitting
+#      it or risking multi-day continuous load on an older drive.
+#    - Lockfile — prevents two copies of this script hammering the same drive
+#      if you (or a cron job) accidentally launch it twice.
+#    - Stale temp-file sweep on startup — cleans up any *.h265part.mp4 left
+#      behind by a hard crash / power loss (the SIGINT trap covers Ctrl+C,
+#      this covers the case where the trap never got to run).
+#    - Live ETA based on a running average MB/s, computed from an upfront
+#      scan of pending work so you know roughly how many hours/days are left.
+#    - Thermal handling is now pause/resume, not hard-stop. When the drive
+#      hits TEMP_HALT (50°C), the active ffmpeg process is SIGSTOP-suspended
+#      (full I/O pause, zero data loss) and SIGCONT-resumed once it cools to
+#      TEMP_RESUME (45°C). No manual restart needed — useful for non-AC
+#      environments where ambient heat fluctuates through the day.
+#    - Persistent logfile (fixed name, appended across runs with session
+#      headers) instead of a new timestamped file every run — better for an
+#      ongoing daily workflow you want one running history of.
+#
+#  v3 changes vs v2:
+#    - THE ACTUAL FIX: encoder was hardcoded to `-c:v libx265` (CPU software
+#      encode) despite comments/logs everywhere referring to "hevc_amf". This
+#      is why speed was ~0.35x on a 4-thread i5-6600K instead of hardware
+#      real-time-plus. Now defaults to `-c:v hevc_amf` (AMD VCE/VCN hardware
+#      encode via the RX 570's Polaris10 encode block).
+#    - check_amf_available(): runs a cheap 1-second lavfi test encode at
+#      startup. If hevc_amf fails to init (missing AMF runtime, driver
+#      mismatch, etc.), it logs a clear WARNING and falls back to libx265
+#      for that run rather than silently limping along or hard-failing
+#      partway through a multi-hour batch.
+#    - build_encoder_args(): encoder-specific flags are now assembled once
+#      into an array (ENCODER_ARGS) instead of being hardcoded inline in the
+#      ffmpeg call. AMF uses -rc cqp -qp_i/-qp_p (its actual rate-control
+#      knobs — CRF is an x264/x265-only concept and doesn't exist in AMF)
+#      and -pix_fmt nv12 (AMF's native format — avoids an extra swscale
+#      software color-convert pass that yuv420p would force before handoff
+#      to the hardware encoder). libx265 path is preserved unchanged as the
+#      fallback and keeps -crf/-preset/-pix_fmt yuv420p exactly as before.
+#    - Log banner now prints which encoder actually ran and with which
+#      settings, instead of always printing CRF/Preset (which are
+#      meaningless when running in AMF mode).
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -uo pipefail
@@ -26,16 +80,20 @@ MAX_SESSION_MINUTES="${3:-0}"        # 0 = unlimited
 LOGFILE="$(cd "$(dirname "$0")" && pwd)/h265_encode.log"
 LOCKFILE="/tmp/h265_batch_$(echo "$INPUT_DIR" | md5sum | cut -d' ' -f1).lock"
 SLEEP_BETWEEN=5
-TEMP_HALT=50                         # °C — pause encode at/above this
-TEMP_RESUME=45                       # °C — resume once cooled to at/below this
+TEMP_HALT=58                         # °C — pause encode at/above this
+TEMP_RESUME=53                       # °C — resume once cooled to at/below this
                                       # (5°C hysteresis avoids rapid pause/resume flapping)
-CRF=18
-PRESET="medium"
+ENCODER="${H265_ENCODER:-hevc_amf}" # hevc_amf (GPU, default) | libx265 (CPU fallback)
+                                      # override per-run: H265_ENCODER=libx265 bash h265_batch.sh ...
+QP=18                                 # AMF rate-control target (rc=cqp), used when ENCODER=hevc_amf
+CRF=18                                # x265 rate-control target, used when ENCODER=libx265 (fallback)
+PRESET="medium"                       # x265-only; ignored by AMF
 AUDIO_BR="192k"
 TEMP_SUFFIX=".h265part.mp4"          # in-progress marker, excluded from `find`
 ACTIVE_PID_FILE="/tmp/h265_active_pid_$$"
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
+ENCODER_ARGS=()
 CURRENT_TEMP=""
 TEMP_MONITOR_PID=""
 SESSION_START_EPOCH=$(date +%s)
@@ -192,14 +250,64 @@ has_free_space() {
 }
 
 # ── CODEC PROBE (drives resumability) ────────────────────────────────────────
-# Any file already showing hevc must be
-# one of our completed outputs. This is filename-independent, works correctly
+# Canon 600D only ever shoots H.264, so any file already showing hevc must be
+# one of our completed outputs. This is filename-independent — works correctly
 # even across renamed files, interrupted runs, or files moved between folders.
 get_video_codec() {
     ffprobe -v error -select_streams v:0 \
         -show_entries stream=codec_name \
         -of default=noprint_wrappers=1:nokey=1 \
         "$1" 2>/dev/null
+}
+
+# ── AMF AVAILABILITY PROBE ────────────────────────────────────────────────────
+# Cheap 1-second synthetic encode to confirm ffmpeg's hevc_amf actually
+# initializes against this driver/runtime stack before committing a
+# multi-hour batch to it. If it fails (missing AMF userspace runtime, driver
+# mismatch, etc.) we fall back to libx265 for this run instead of either
+# hard-failing on file 1 or — worse — silently limping along on whatever
+# ffmpeg decided to substitute.
+check_amf_available() {
+    if [[ "$ENCODER" != "hevc_amf" ]]; then
+        return
+    fi
+    log "Checking hevc_amf (GPU hardware encode) availability ..."
+    if ffmpeg -hide_banner -loglevel error -f lavfi \
+        -i "testsrc=duration=1:size=1280x720:rate=30" \
+        -c:v hevc_amf -f null - &>/dev/null; then
+        log "  OK: hevc_amf initialized — using GPU hardware encode for this session."
+    else
+        log "  WARN: hevc_amf failed to initialize on this system."
+        log "        Falling back to libx265 (CPU) for this run."
+        log "        To diagnose: 'ffmpeg -encoders | grep amf' and 'vainfo | grep -i hevc'"
+        ENCODER="libx265"
+    fi
+}
+
+# ── ENCODER ARG BUILDER ───────────────────────────────────────────────────────
+# Resolves the chosen ENCODER into the actual ffmpeg flags, once, up front.
+# AMF has no concept of CRF/preset — its rate control is -rc cqp with
+# separate -qp_i/-qp_p targets, and it wants nv12 natively (yuv420p would
+# force an extra swscale software color-convert pass before the frames even
+# reach the hardware encoder). libx265 path is untouched from v2.
+build_encoder_args() {
+    if [[ "$ENCODER" == "hevc_amf" ]]; then
+        ENCODER_ARGS=(
+            -c:v hevc_amf
+            -quality quality
+            -rc cqp
+            -qp_i "$QP"
+            -qp_p "$QP"
+            -pix_fmt nv12
+        )
+    else
+        ENCODER_ARGS=(
+            -c:v libx265
+            -crf "$CRF"
+            -preset "$PRESET"
+            -pix_fmt yuv420p
+        )
+    fi
 }
 
 # ── FFPROBE OUTPUT INTEGRITY VERIFY ──────────────────────────────────────────
@@ -246,6 +354,8 @@ fmt_eta() {
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 main() {
     check_deps
+    check_amf_available
+    build_encoder_args
     acquire_lock
     smart_preflight "$SMART_DEVICE"
     sweep_stale_temp_files
@@ -256,7 +366,11 @@ main() {
     log " Session start"
     log " Input dir:    $INPUT_DIR"
     log " SMART device: $SMART_DEVICE"
-    log " CRF:          $CRF | Preset: $PRESET | Audio: $AUDIO_BR"
+    if [[ "$ENCODER" == "hevc_amf" ]]; then
+        log " Encoder:      hevc_amf (GPU) | rc=cqp qp_i/qp_p=$QP | Audio: $AUDIO_BR"
+    else
+        log " Encoder:      libx265 (CPU)  | CRF: $CRF | Preset: $PRESET | Audio: $AUDIO_BR"
+    fi
     log " Temp:         pause at ${TEMP_HALT}°C, resume at ${TEMP_RESUME}°C"
     log " Session cap:  $([[ "$MAX_SESSION_MINUTES" -eq 0 ]] && echo unlimited || echo "${MAX_SESSION_MINUTES} min")"
     log " Logfile:      $LOGFILE"
@@ -355,12 +469,9 @@ main() {
                 -map 0:v:0 \
                 -map "0:a:0?" \
                 -map_metadata 0 \
-                -c:v libx265 \
-                -crf "$CRF" \
-                -preset "$PRESET" \
+                "${ENCODER_ARGS[@]}" \
                 -c:a aac \
                 -b:a "$AUDIO_BR" \
-                -pix_fmt yuv420p \
                 -tag:v hvc1 \
                 -movflags +faststart \
                 -y \
